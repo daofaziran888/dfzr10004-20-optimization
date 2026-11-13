@@ -1,4 +1,4 @@
-"""采集审计日志接口：维护审计记录，覆盖标记复核、归档记录等动作。"""
+"""采集审计日志接口：维护审计记录，覆盖标记复核、归档记录与归档待重试清单。"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,11 +6,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
+from app.services.archive import ArchiveService
 from app.services.audit import AuditService
 
 router = APIRouter(prefix="/api/audit", tags=["采集审计日志"])
 
 service = AuditService()
+archive_service = ArchiveService()
 
 LIST_FIELDS = ["记录编号", "操作类型", "采集计划", "执行人", "执行时间", "结果摘要", "变更内容", "复核状态"]
 STATUSES = ["已记录", "已复核", "已归档"]
@@ -28,6 +30,20 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出采集审计日志清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "audit", "total": total, "items": items}
+
+
+@router.get("/pending-retries")
+def pending_retries() -> dict[str, Any]:
+    """归档待重试清单：迁移失败与校验失败的分片，随批次状态实时刷新。"""
+    items = archive_service.pending_retries()
+    return {"total": len(items), "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +72,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出采集审计日志清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "audit", "total": total, "items": items}

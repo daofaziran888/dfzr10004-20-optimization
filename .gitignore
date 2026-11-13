@@ -85,3 +85,6 @@ desktop.ini
 *.db
 *.pid
 *.seed
+
+# ===== 运行数据（归档批次等持久化文件） =====
+backend/data/

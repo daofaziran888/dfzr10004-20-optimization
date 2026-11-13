@@ -55,31 +55,102 @@
       </tbody>
     </table>
 
+    <section class="batch-section">
+      <h3>归档批次</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th v-for="column in batchColumns" :key="column">{{ column }}</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="batch in batches" :key="String(batch['批次编号'])">
+            <td>{{ batch['批次编号'] }}</td>
+            <td>{{ batch['配置编号'] }}</td>
+            <td>{{ batch['状态'] }}</td>
+            <td>{{ (batch['已处理分片'] ?? []).length }} / {{ (batch['选中分片'] ?? []).length }}</td>
+            <td>{{ (batch['失败分片'] ?? []).length }}</td>
+            <td>{{ batch['释放容量MB'] }}</td>
+            <td>{{ batch['剩余容量MB'] ?? '—' }}</td>
+            <td>{{ batch['审计记录编号'] ?? '—' }}</td>
+            <td class="row-actions">
+              <button class="link" type="button" @click="toggleBatch(batch['批次编号'])">
+                {{ expandedBatch === batch['批次编号'] ? '收起' : '回看' }}
+              </button>
+            </td>
+          </tr>
+          <tr v-if="!batches.length">
+            <td :colspan="batchColumns.length + 1" class="empty-state">暂无归档批次，可在已启用配置上执行归档</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div v-if="batchDetail" class="batch-detail">
+        <h4>批次 {{ batchDetail['批次编号'] }} 分片明细（保留天数 {{ batchDetail['保留天数'] }} 天快照）</h4>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>分片编号</th>
+              <th>大小MB</th>
+              <th>批次内状态</th>
+              <th>归档前校验</th>
+              <th>源分片状态</th>
+              <th>失败文件</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="shard in batchDetail['分片明细']" :key="shard['分片编号']">
+              <td>{{ shard['分片编号'] }}</td>
+              <td>{{ shard['大小MB'] }}</td>
+              <td>{{ shard['批次内状态'] }}</td>
+              <td>{{ shard['校验结果'] }}</td>
+              <td>{{ shard['源分片状态'] }}</td>
+              <td>{{ shard['失败文件']?.length ? shard['失败文件'].join('、') : '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条采集存储策略记录</span>
+      <span v-if="noticeMessage" class="notice-text">{{ noticeMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, any>
 
 const ENDPOINT = '/api/storage'
 const columns = ["配置编号", "存储路径", "文件格式", "分片大小", "压缩算法", "保留天数", "归档策略", "是否启用"]
-const actions = ["提交校验", "启用配置", "停用配置"]
-const statuses = ["草稿", "待校验", "已启用", "已停用"]
-const stats = [{"label": "存储配置总数", "value": 0}, {"label": "待校验配置", "value": 0}, {"label": "已启用配置", "value": 0}]
+const actions = ["提交校验", "启用配置", "停用配置", "执行归档"]
+const batchColumns = ["批次编号", "配置编号", "状态", "已处理分片", "失败分片", "释放容量MB", "剩余容量MB", "审计记录编号"]
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const noticeMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+const batches = ref<Row[]>([])
+const summary = ref<Row>({ totals: {} })
+const expandedBatch = ref('')
+const batchDetail = ref<Row | null>(null)
+
+const stats = computed(() => [
+  { label: '存储配置总数', value: total.value },
+  { label: '归档批次数', value: summary.value?.totals?.['归档批次数'] ?? 0 },
+  { label: '已回收容量(MB)', value: summary.value?.totals?.['已回收容量MB'] ?? 0 },
+  { label: '剩余容量(MB)', value: summary.value?.totals?.['剩余容量MB'] ?? 0 },
+])
 
 function resetFilters() {
   filters.value = {}
@@ -96,13 +167,22 @@ function openCreate() {
 
 async function runAction(action: string, row: Row) {
   errorMessage.value = ''
+  noticeMessage.value = ''
+  const isArchive = action === '执行归档'
+  const url = isArchive ? `${ENDPOINT}/${row.id}/archive` : `${ENDPOINT}/${row.id}/actions`
   try {
-    const response = await request(`${ENDPOINT}/${row.id}/actions`, {
+    const response = await request(url, {
       method: 'POST',
-      body: JSON.stringify({ action }),
+      body: JSON.stringify(isArchive ? {} : { action }),
     })
+    const payload = await response.json().catch(() => null)
     if (!response.ok) {
-      throw new Error('采集存储策略动作未生效，请稍后重试')
+      throw new Error(payload?.detail ?? '采集存储策略动作未生效，请稍后重试')
+    }
+    if (payload && payload.ok === false) {
+      errorMessage.value = payload.message ?? '采集存储策略动作未生效'
+    } else if (payload?.message) {
+      noticeMessage.value = payload.message
     }
     await reload()
   } catch (error) {
@@ -110,17 +190,50 @@ async function runAction(action: string, row: Row) {
   }
 }
 
+async function toggleBatch(code: string) {
+  errorMessage.value = ''
+  if (expandedBatch.value === code) {
+    expandedBatch.value = ''
+    batchDetail.value = null
+    return
+  }
+  try {
+    const response = await request(`${ENDPOINT}/archives/${code}`)
+    if (!response.ok) {
+      throw new Error('归档批次详情读取失败')
+    }
+    batchDetail.value = await response.json()
+    expandedBatch.value = code
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '归档批次详情读取失败'
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    const [listResp, batchResp, summaryResp] = await Promise.all([
+      request(`${ENDPOINT}?${query}`),
+      request(`${ENDPOINT}/archives`),
+      request(`${ENDPOINT}/archives/summary`),
+    ])
+    if (!listResp.ok) {
       throw new Error('存储配置列表读取失败')
     }
-    const payload = await response.json()
+    const payload = await listResp.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    if (batchResp.ok) {
+      batches.value = (await batchResp.json()).items ?? []
+    }
+    if (summaryResp.ok) {
+      summary.value = await summaryResp.json()
+    }
+    if (expandedBatch.value) {
+      const detailResp = await request(`${ENDPOINT}/archives/${expandedBatch.value}`)
+      batchDetail.value = detailResp.ok ? await detailResp.json() : null
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '采集存储策略列表读取失败'
   }
@@ -128,3 +241,24 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.batch-section {
+  margin-top: 16px;
+}
+.batch-section h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+.batch-detail {
+  margin-top: 12px;
+}
+.batch-detail h4 {
+  font-size: 13px;
+  margin: 0 0 8px;
+  color: var(--muted);
+}
+.notice-text {
+  color: #067647;
+}
+</style>

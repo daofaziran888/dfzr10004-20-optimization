@@ -72,6 +72,26 @@ npm run dev
   `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 业务数据持久化在 `backend/data/store.json`（归档批次、失败分片、容量回收状态重启不丢），
+  可用环境变量 `APP_DATA_FILE` 指向其他文件。
+
+## 存储归档流程
+
+`backend/app/services/archive.py` 是存储配置 → 审计台账的归档引擎：
+
+- 按配置编号、存储路径、保留天数与分片边界选出待迁移分片（`POST /api/storage/{id}/archive`）；
+- 归档前逐分片校验，校验失败保留原数据并进入审计台账的待重试清单
+  （`GET /api/audit/pending-retries`）；
+- 迁移中断后批次保持「进行中」，再次提交从失败分片继续，已确认分片不重复搬移；
+- 批次完成前源分片只标记「已迁移」，完成后才清理并固化容量回收结论
+  （`GET /api/storage/archives/summary`，存储配置页与审计页共用）；
+- 同一存储路径的并发归档拒绝后到请求；配置编号不可重复登记，历史保留天数与已归档记录不被改写。
+
+回归测试（锚点 STOR-0003 / AUDI-0003）：
+
+```bash
+make test   # 或 cd backend && .venv/bin/python -m pytest tests -q
+```
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

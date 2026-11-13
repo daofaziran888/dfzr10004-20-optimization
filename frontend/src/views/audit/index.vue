@@ -31,12 +31,14 @@
       <thead>
         <tr>
           <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th>归档批次</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td>{{ row['归档批次'] ?? '—' }}</td>
           <td class="row-actions">
             <button
               v-for="action in actions"
@@ -47,13 +49,79 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="row['归档批次']"
+              class="link"
+              type="button"
+              @click="toggleBatch(row['归档批次'])"
+            >
+              {{ expandedBatch === row['归档批次'] ? '收起批次' : '回看批次' }}
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无采集审计日志数据，可先登记审计记录</td>
+          <td :colspan="columns.length + 2" class="empty-state">暂无采集审计日志数据，可先登记审计记录</td>
         </tr>
       </tbody>
     </table>
+
+    <div v-if="batchDetail" class="batch-detail">
+      <h4>
+        归档批次 {{ batchDetail['批次编号'] }}（{{ batchDetail['状态'] }}）：回收容量
+        {{ batchDetail['释放容量MB'] }}MB，剩余容量 {{ batchDetail['剩余容量MB'] ?? '—' }}MB
+      </h4>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>分片编号</th>
+            <th>大小MB</th>
+            <th>批次内状态</th>
+            <th>归档前校验</th>
+            <th>源分片状态</th>
+            <th>失败文件</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="shard in batchDetail['分片明细']" :key="shard['分片编号']">
+            <td>{{ shard['分片编号'] }}</td>
+            <td>{{ shard['大小MB'] }}</td>
+            <td>{{ shard['批次内状态'] }}</td>
+            <td>{{ shard['校验结果'] }}</td>
+            <td>{{ shard['源分片状态'] }}</td>
+            <td>{{ shard['失败文件']?.length ? shard['失败文件'].join('、') : '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <section class="retry-section">
+      <h3>归档待重试清单</h3>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>归档批次</th>
+            <th>配置编号</th>
+            <th>分片编号</th>
+            <th>原因</th>
+            <th>审计记录编号</th>
+            <th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in retries" :key="`${item['归档批次']}-${item['分片编号']}`">
+            <td>{{ item['归档批次'] }}</td>
+            <td>{{ item['配置编号'] }}</td>
+            <td>{{ item['分片编号'] }}</td>
+            <td>{{ item['原因'] }}</td>
+            <td>{{ item['审计记录编号'] ?? '—' }}</td>
+            <td>{{ item['状态'] }}</td>
+          </tr>
+          <tr v-if="!retries.length">
+            <td colspan="6" class="empty-state">暂无待重试分片</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条采集审计日志记录</span>
@@ -63,23 +131,33 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, any>
 
 const ENDPOINT = '/api/audit'
 const columns = ["记录编号", "操作类型", "采集计划", "执行人", "执行时间", "结果摘要", "变更内容", "复核状态"]
 const actions = ["标记复核", "归档记录"]
-const statuses = ["已记录", "已复核", "已归档"]
-const stats = [{"label": "审计记录总数", "value": 0}, {"label": "已复核记录", "value": 0}, {"label": "已归档记录", "value": 0}]
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+const retries = ref<Row[]>([])
+const summary = ref<Row>({ totals: {} })
+const expandedBatch = ref('')
+const batchDetail = ref<Row | null>(null)
+
+const stats = computed(() => [
+  { label: '审计记录总数', value: total.value },
+  { label: '归档批次数', value: summary.value?.totals?.['归档批次数'] ?? 0 },
+  { label: '已回收容量(MB)', value: summary.value?.totals?.['已回收容量MB'] ?? 0 },
+  { label: '待重试分片', value: retries.value.length },
+])
 
 function resetFilters() {
   filters.value = {}
@@ -110,17 +188,50 @@ async function runAction(action: string, row: Row) {
   }
 }
 
+async function toggleBatch(code: string) {
+  errorMessage.value = ''
+  if (expandedBatch.value === code) {
+    expandedBatch.value = ''
+    batchDetail.value = null
+    return
+  }
+  try {
+    const response = await request(`/api/storage/archives/${code}`)
+    if (!response.ok) {
+      throw new Error('归档批次详情读取失败')
+    }
+    batchDetail.value = await response.json()
+    expandedBatch.value = code
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '归档批次详情读取失败'
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
+    const [listResp, retryResp, summaryResp] = await Promise.all([
+      request(`${ENDPOINT}?${query}`),
+      request(`${ENDPOINT}/pending-retries`),
+      request('/api/storage/archives/summary'),
+    ])
+    if (!listResp.ok) {
       throw new Error('审计记录列表读取失败')
     }
-    const payload = await response.json()
+    const payload = await listResp.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    if (retryResp.ok) {
+      retries.value = (await retryResp.json()).items ?? []
+    }
+    if (summaryResp.ok) {
+      summary.value = await summaryResp.json()
+    }
+    if (expandedBatch.value) {
+      const detailResp = await request(`/api/storage/archives/${expandedBatch.value}`)
+      batchDetail.value = detailResp.ok ? await detailResp.json() : null
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '采集审计日志列表读取失败'
   }
@@ -128,3 +239,21 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.batch-detail {
+  margin-top: 12px;
+}
+.batch-detail h4 {
+  font-size: 13px;
+  margin: 0 0 8px;
+  color: var(--muted);
+}
+.retry-section {
+  margin-top: 16px;
+}
+.retry-section h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+</style>
